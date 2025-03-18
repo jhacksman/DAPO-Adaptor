@@ -11,6 +11,7 @@ import logging
 # Import from verl framework
 from verl.workers.rollout.vllm_rollout.vllm_rollout import vLLMRollout
 from verl import DataProto
+from tensordict import TensorDict
 
 # Import from verification module
 from .verification_utils import verify_response, compare_responses
@@ -105,12 +106,56 @@ class VerificationRollout(vLLMRollout):
         """
         logger.info(f"Generating {kinf} responses for each prompt")
         
-        # This is a placeholder implementation
-        # In a real implementation, this would use the vLLMRollout's generate method
-        # with modified sampling parameters to generate multiple responses
+        # Configure sampling parameters for multiple response generation
+        sampling_kwargs = {
+            'n': kinf,  # Generate kinf responses per prompt
+            'temperature': self.verification_config.get('temperature', 0.7),
+            'top_p': self.verification_config.get('top_p', 0.9),
+            'top_k': self.verification_config.get('top_k', 50),
+            'do_sample': True
+        }
         
-        # TODO: Implement actual response generation
-        responses = []
+        # Add do_sample flag to meta_info to ensure sampling is enabled
+        prompts_with_sampling = DataProto(
+            batch=prompts.batch,
+            non_tensor_batch=prompts.non_tensor_batch,
+            meta_info={**prompts.meta_info, 'do_sample': True}
+        )
+        
+        # Use the parent class's generate_sequences method with modified sampling parameters
+        with self.update_sampling_params(**sampling_kwargs):
+            # Generate multiple responses using the vLLM engine
+            all_responses = super().generate_sequences(prompts_with_sampling)
+            
+            # Extract individual responses from the batch
+            batch_size = prompts.batch.batch_size[0]
+            responses = []
+            
+            # The responses are interleaved in the output batch
+            # We need to separate them into individual DataProto objects
+            for i in range(kinf):
+                # Extract responses for the current sample index
+                indices = list(range(i, batch_size * kinf, kinf))
+                
+                # Create a new DataProto for each response
+                response_batch = TensorDict({
+                    key: all_responses.batch[key][indices] 
+                    for key in all_responses.batch.keys()
+                }, batch_size=(batch_size,))
+                
+                # Create non_tensor_batch if needed
+                response_non_tensor = {}
+                for key, val in all_responses.non_tensor_batch.items():
+                    response_non_tensor[key] = val[indices]
+                
+                # Create a DataProto for the current response
+                response = DataProto(
+                    batch=response_batch,
+                    non_tensor_batch=response_non_tensor,
+                    meta_info=all_responses.meta_info
+                )
+                
+                responses.append(response)
         
         logger.info(f"Generated {len(responses)} responses")
         return responses
@@ -128,12 +173,46 @@ class VerificationRollout(vLLMRollout):
         """
         logger.info(f"Verifying {len(responses)} responses with {kverif} samples each")
         
-        # This is a placeholder implementation
-        # In a real implementation, this would use the verification_utils.verify_response
-        # function to generate verification scores for each response
-        
-        # TODO: Implement actual response verification
+        # Use the verification_utils.verify_response function to generate 
+        # verification scores for each response
         scores = []
+        
+        # Get the appropriate verification prompt template based on the task type
+        prompt_template = self.verification_config.get('verification_prompt', None)
+        
+        # Process responses in batches for efficiency
+        batch_size = self.verification_config.get('verification_batch_size', 10)
+        
+        for i in range(0, len(responses), batch_size):
+            batch_responses = responses[i:i+batch_size]
+            batch_scores = []
+            
+            # Process each response in the current batch
+            for response in batch_responses:
+                # Use the verify_response function from verification_utils
+                # Pass the inference engine as the model for verification
+                score = verify_response(
+                    response=response,
+                    model=self.inference_engine,
+                    kverif=kverif,
+                    prompt_template=prompt_template
+                )
+                batch_scores.append(score)
+            
+            # Add batch scores to the overall scores list
+            scores.extend(batch_scores)
+            
+            logger.info(f"Verified batch {i//batch_size + 1}/{(len(responses) + batch_size - 1)//batch_size} "
+                       f"with scores: {batch_scores}")
+        
+        # Normalize scores if needed
+        if self.verification_config.get('normalize_scores', False):
+            if scores:
+                min_score = min(scores)
+                max_score = max(scores)
+                if max_score > min_score:
+                    scores = [(score - min_score) / (max_score - min_score) for score in scores]
+                    logger.info(f"Normalized scores to range [0, 1]")
         
         logger.info(f"Verification complete with scores: {scores}")
         return scores
@@ -141,6 +220,10 @@ class VerificationRollout(vLLMRollout):
     def compare_responses(self, top_responses: List[DataProto], ktie: int) -> int:
         """
         Compare the top candidate responses to break ties.
+        
+        This method implements a tournament-style comparison between the top responses
+        to determine the best one. It follows Algorithm 1 from the SSaSEITSbSV paper,
+        specifically the tie-breaking stage.
         
         Args:
             top_responses: The top candidate responses to compare.
@@ -151,14 +234,55 @@ class VerificationRollout(vLLMRollout):
         """
         logger.info(f"Comparing {len(top_responses)} top responses with {ktie} samples each")
         
-        # This is a placeholder implementation
-        # In a real implementation, this would use the verification_utils.compare_responses
-        # function to perform pairwise comparisons between the top responses
+        # If there's only one response, return it
+        if len(top_responses) == 1:
+            return 0
         
-        # TODO: Implement actual response comparison
-        winner_idx = 0
+        # Get the comparison prompt template if specified
+        prompt_template = self.verification_config.get('comparison_prompt', None)
         
-        logger.info(f"Comparison complete with winner index: {winner_idx}")
+        # Initialize win counts for each response
+        win_counts = [0] * len(top_responses)
+        
+        # Perform pairwise comparisons between all top responses
+        for i in range(len(top_responses)):
+            for j in range(i + 1, len(top_responses)):
+                logger.info(f"Comparing response {i} with response {j}")
+                
+                # Use the compare_responses function from verification_utils
+                # to determine the winner of this pair
+                winner = compare_responses(
+                    response1=top_responses[i],
+                    response2=top_responses[j],
+                    model=self.inference_engine,
+                    ktie=ktie,
+                    prompt_template=prompt_template
+                )
+                
+                # Increment the win count for the winner
+                if winner == 0:
+                    win_counts[i] += 1
+                    logger.info(f"Response {i} won against response {j}")
+                else:
+                    win_counts[j] += 1
+                    logger.info(f"Response {j} won against response {i}")
+        
+        # Find the response with the most wins
+        max_wins = max(win_counts)
+        winners = [i for i, wins in enumerate(win_counts) if wins == max_wins]
+        
+        # If there's still a tie, choose the response with the highest verification score
+        if len(winners) > 1:
+            logger.info(f"Multiple winners with {max_wins} wins each: {winners}")
+            
+            # In case of a tie, return the first winner
+            # This is a simplification; in a more sophisticated implementation,
+            # we could use additional criteria to break the tie
+            winner_idx = winners[0]
+        else:
+            winner_idx = winners[0]
+        
+        logger.info(f"Comparison complete with win counts: {win_counts} and winner index: {winner_idx}")
         return winner_idx
     
     def _find_top_responses(self, scores: List[float]) -> List[int]:
