@@ -14,7 +14,10 @@ See the documentation in docs/verification/ for more details.
 
 from .verification_rollout import VerificationRollout
 from .verification_utils import verify_response, compare_responses
-from .prompts import VERIFICATION_PROMPT, COMPARISON_PROMPT
+from .prompts import (
+    VERIFICATION_PROMPT, COMPARISON_PROMPT,
+    MATH_VERIFICATION_PROMPT, LOGIC_VERIFICATION_PROMPT, FACTUAL_VERIFICATION_PROMPT
+)
 
 __all__ = [
     'VerificationRollout',
@@ -22,4 +25,7 @@ __all__ = [
     'compare_responses',
     'VERIFICATION_PROMPT',
     'COMPARISON_PROMPT',
+    'MATH_VERIFICATION_PROMPT',
+    'LOGIC_VERIFICATION_PROMPT',
+    'FACTUAL_VERIFICATION_PROMPT',
 ]
